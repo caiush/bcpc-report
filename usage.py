@@ -10,14 +10,16 @@ from novaclient.v1_1 import client as nova_client
 from cinderclient.v1 import client as cinder_client
 import csv
 
+start_time = datetime.datetime(2015,01,01)
+end_time = datetime.datetime(2015,04,01)
+
+
 config = yaml.load(open("usage.yml"))
 sql_config = config["mysql"]
 con = mdb.connect(sql_config["ip"], 
                   sql_config["user"],
                   sql_config["password"])
 
-start_time = datetime.datetime(2015,04,01)
-end_time = datetime.datetime(2015,05,01)
 now = datetime.datetime.utcnow()
 if end_time> now:
     print " resetting end to now"
@@ -30,21 +32,24 @@ cost_per_hr = { "m1.tiny" : 0.013,
                 "m1.large"  : 0.142,
                 "m1.xlarge" : 0.56 }
 
-volume_cost_per_gbhr = {"HDD" : 0.10,
-                        "SSD" : 0.20 }
+volume_cost_per_gbhr = {"HDD" : 0.10/24./30,
+                        "SSD" : 0.20/24./30 }
 
-images_cost_per_gbhr = 0.20
+images_cost_per_gbhr = 0.20/24./30.
 
 quota_costs_per_hr = { "cores" : 0.009,
                        "ram" : 0.009, # per gb
-                       "volumes_gb" : 0.10  # per gb
+                       "volume_gb" : 0.10/24./30.  # per gb
                        } 
 
 keystone_creds = config["keystone"]
 
 cost_per_hr_custom = 0.60
 
-kclient = keystone_client.Client(**keystone_creds)
+kclient = keystone_client.Client(username= keystone_creds["username"], password=keystone_creds["password"],
+                                 auth_url=keystone_creds["auth_url"], cacert=keystone_creds["ca_cert"],
+                                 tenant_name=keystone_creds["tenant"])
+
 nclient = nova_client.Client(keystone_creds["username"], keystone_creds["password"],
                              keystone_creds["tenant"], keystone_creds["auth_url"],
                              service_type="compute", cacert=keystone_creds["ca_cert"])
@@ -56,6 +61,7 @@ cclient = cinder_client.Client(keystone_creds["username"], keystone_creds["passw
 # grab a list of tenants
 project_summary = {}
 tenants= kclient.tenants.list()
+
 for t in tenants:
     q = nclient.quotas.get(t.id)
     c = cclient.quotas.get(t.id)
@@ -69,11 +75,12 @@ for t in tenants:
                                         "volume_gb" : c.gigabytes,                                              
                                         "total_cost" : 0
                                         } }
-    for resource in quota_costs_per_hr:
+    for resource in quota_costs_per_hr.keys():
         if resource in project_summary[tid]["quota"]: 
-            project_summary[tid]["quota"]["total_cost"] += period_in_hrs*quota_costs_per_hr[resource]
+            project_summary[tid]["quota"]["total_cost"] =  project_summary[tid]["quota"]["total_cost"] +  period_in_hrs*quota_costs_per_hr[resource]* project_summary[tid]["quota"][resource]
 
-print project_summary
+print "Number of projects :" , len(project_summary)
+
 # get a list of instances in this time period
 instances = []    
 con.select_db("nova")
@@ -105,7 +112,7 @@ lmem_hrs = lambda x: x["mem"]*x["uptime"]
 lroot_hrs = lambda x: x["root_gb"]*x["uptime"]
 lhrs = lambda x: x["uptime"]
 
-
+print " Number of instances" , len(instances)
 #
 # nova
 #
@@ -131,6 +138,9 @@ for project_id, project_instances in itertools.groupby(instances, key = lambda x
             "cost" : reduce( lambda x, y: x+y, map(lambda x: x["uptime"]*cost, jj))}
 
     p["total_cost"] = sum( [i["cost"] for i in p["flavors"].values()])
+    if project_id not in project_summary:
+        print " Adding project (instances): " , project_id
+        project_summary[project_id] = { "id" : project_id, "name" : "?"}
     project_summary[project_id]["instances"] = p
 
 #
@@ -154,7 +164,9 @@ while row:
                         "vtype" : volume_type })
     row = cinder_c.fetchone()                       
 
+print " Number of volumes ", len(volumes)
 # summarize by project
+
 
 for project_id, project_volumes in itertools.groupby(volumes, key = lambda x : x["project_id"]):
     ii = list(project_volumes)
@@ -171,6 +183,9 @@ for project_id, project_volumes in itertools.groupby(volumes, key = lambda x : x
             "cost" : gbhr*volume_cost_per_gbhr[vtype]}
 
     p["total_cost"] = sum( [q["cost"] for q in p["types"].values()])
+    if project_id not in project_summary:
+        print " Adding project (volumes): " , project_id
+        project_summary[project_id] = { "id" : project_id, "name" : "?"}
     project_summary[project_id]["volumes"] = p 
 
 #
@@ -192,6 +207,8 @@ while row:
                      "uptime" : (last_time - begin_time).total_seconds() / 60. / 60. })    
     row = glance_c.fetchone()
 
+print " number of images" , len(images)
+
 # group by project
 for project_id, project_images in itertools.groupby(images, key = lambda x : x["project_id"]):
     ii = list(project_images)
@@ -200,14 +217,17 @@ for project_id, project_images in itertools.groupby(images, key = lambda x : x["
           "size_gb" : sum([x["size_gb"] for x in ii]),
           "gbhrs" : gbhr,
           "total_cost" : gbhr*images_cost_per_gbhr }
+    if project_id not in project_summary:
+        print "adding project (images): " , project_id
+        project_summary[project_id] = { "id" : project_id, "name" : "?"}    
     project_summary[project_id]["images"] = p    
-
+    
 
 projects = project_summary.values() 
 
-projects.sort(cmp = lambda x, y: cmp(x["quota"]["total_cost"], y["quota"]["total_cost"]))
+projects.sort(cmp = lambda x, y: -1*cmp(x.get("quota", {}).get("total_cost", 0), y.get("quota", {}).get("total_cost", 0)))
 
-print projects
+
 def kex(d, path, default=""):
     for k in d:
         if k==path[0]:
@@ -217,7 +237,7 @@ def kex(d, path, default=""):
                 return kex(d[k], path[1:], default)
     return default
 
-print kex(projects[0], ("instances", "flavors", "m1.tiny", "count"), "?")
+
 
 columns = [
     ["Name" , ("name",)],
@@ -248,7 +268,7 @@ for vtype in ["HDD", "SSD"]:
         [vtype+" Cost" , ("volumes", "types", vtype, "cost")],
         ]
 columns.append(["volumes cost", ("volumes", "total_cost")]    )
-print columns
+
 
 columns+= [
     ["Images", ("images", "count")],
@@ -262,6 +282,6 @@ with open("output.csv", "wb") as f:
     for p in projects:
         csvw.writerow( [ kex(p, c[1]) for c in columns])
         
-        for c, k in columns:
-            print c, k, kex(p, k)
+#        for c, k in columns:
+#            print c, k, kex(p, k)
         
